@@ -1,0 +1,1028 @@
+// ==UserScript==
+// @name         WikiPeek RU
+// @namespace    https://github.com/Sinusis/wikipeek-ru
+// @version      1.0.0
+// @description  Предпросмотр статей Wikipedia для любых ссылок: сначала русская версия, затем английская.
+// @author       ChatGPT/Sinusis
+// @match        *://*/*
+// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @connect      wikipedia.org
+// @connect      *.wikipedia.org
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SCRIPT_ID = 'tm-wiki-ru-preview';
+  const THEME_KEY = 'tmwp_theme';
+  const HOVER_DELAY_MS = 300;
+  const HIDE_DELAY_MS = 140;
+  const CACHE_LIMIT = 250;
+  const MAX_QUERY_LENGTH = 120;
+
+  const SKIP_NAMESPACES = new Set([
+    'special',
+    'file',
+    'image',
+    'category',
+    'talk',
+    'user',
+    'template',
+    'help',
+    'portal',
+    'wikipedia',
+    'module',
+    'служебная',
+    'файл',
+    'категория',
+    'обсуждение',
+    'участник',
+    'шаблон',
+    'справка',
+    'портал',
+    'википедия',
+    'модуль',
+  ]);
+
+  const GENERIC_LINK_TEXTS = new Set([
+    'read more',
+    'more',
+    'learn more',
+    'click here',
+    'here',
+    'link',
+    'source',
+    'website',
+    'official website',
+    'homepage',
+    'open',
+    'view',
+    'details',
+    'читать',
+    'читать далее',
+    'далее',
+    'подробнее',
+    'здесь',
+    'тут',
+    'сюда',
+    'ссылка',
+    'источник',
+    'сайт',
+    'официальный сайт',
+    'перейти',
+    'открыть',
+    'детали',
+  ]);
+
+  const cache = new Map();
+  let activeLink = null;
+  let activeParsed = null;
+  let hoverTimer = 0;
+  let hideTimer = 0;
+  let requestToken = 0;
+  let lastPoint = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+  let cardHovered = false;
+  let pinned = false;
+  let theme = GM_getValue(THEME_KEY, 'dark');
+
+  installStyles();
+  registerThemeMenu();
+
+  const card = document.createElement('div');
+  card.id = SCRIPT_ID;
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-live', 'polite');
+  card.dataset.theme = theme;
+  document.documentElement.appendChild(card);
+
+  card.addEventListener('mouseenter', () => {
+    cardHovered = true;
+    clearTimeout(hideTimer);
+  });
+
+  card.addEventListener('mouseleave', () => {
+    cardHovered = false;
+    scheduleHide();
+  });
+
+  document.addEventListener('mouseover', onMouseOver, true);
+  document.addEventListener('mouseout', onMouseOut, true);
+  document.addEventListener('mousemove', onMouseMove, true);
+  document.addEventListener('focusin', onFocusIn, true);
+  document.addEventListener('focusout', onFocusOut, true);
+  document.addEventListener('mousedown', onMiddleMouseDown, true);
+  document.addEventListener('auxclick', onMiddleAuxClick, true);
+  document.addEventListener('scroll', () => hideCard(false), true);
+  window.addEventListener('resize', () => hideCard(false));
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hideCard(true);
+  });
+
+  function registerThemeMenu() {
+    const labels = {
+      dark: 'тёмная',
+      light: 'светлая',
+      auto: 'системная',
+    };
+    const nextTheme = theme === 'dark' ? 'light' : theme === 'light' ? 'auto' : 'dark';
+    GM_registerMenuCommand(
+      `Wikipedia preview: тема ${labels[theme] || theme} → ${labels[nextTheme]}`,
+      () => {
+        GM_setValue(THEME_KEY, nextTheme);
+        location.reload();
+      },
+    );
+  }
+
+  function onMouseOver(event) {
+    if (pinned) return;
+
+    const link = event.target.closest?.('a[href]');
+    if (!link || link === activeLink || card.contains(link)) return;
+
+    const parsed = parseAnyLink(link);
+    if (!parsed) return;
+
+    activeLink = link;
+    activeParsed = parsed;
+    lastPoint = { x: event.clientX, y: event.clientY };
+    startPreviewLoad(link, parsed, false);
+  }
+
+  function onMouseOut(event) {
+    if (pinned || !activeLink || !activeLink.contains(event.target)) return;
+
+    const toElement = event.relatedTarget;
+    if (toElement && (activeLink.contains(toElement) || card.contains(toElement))) return;
+    scheduleHide();
+  }
+
+  function onMouseMove(event) {
+    if (pinned || !activeLink) return;
+
+    lastPoint = { x: event.clientX, y: event.clientY };
+    if (!card.classList.contains('tmwp-visible') || card.matches(':hover')) return;
+    positionCard(lastPoint.x, lastPoint.y);
+  }
+
+  function onFocusIn(event) {
+    if (pinned) return;
+
+    const link = event.target.closest?.('a[href]');
+    if (!link) return;
+
+    const parsed = parseAnyLink(link);
+    if (!parsed) return;
+
+    activeLink = link;
+    activeParsed = parsed;
+    lastPoint = pointNearElement(link);
+    startPreviewLoad(link, parsed, false);
+  }
+
+  function onFocusOut(event) {
+    if (pinned || !activeLink || event.target !== activeLink) return;
+    scheduleHide();
+  }
+
+  function onMiddleMouseDown(event) {
+    if (event.button !== 1) return;
+
+    if (pinned) {
+      if (card.contains(event.target)) preventMiddleClick(event);
+      return;
+    }
+
+    if (card.contains(event.target) && card.classList.contains('tmwp-visible')) {
+      preventMiddleClick(event);
+      pinCard();
+      return;
+    }
+
+    const link = event.target.closest?.('a[href]');
+    if (!link) return;
+
+    const parsed = parseAnyLink(link);
+    if (!parsed) return;
+
+    preventMiddleClick(event);
+    activeLink = link;
+    activeParsed = parsed;
+    lastPoint = { x: event.clientX, y: event.clientY };
+    pinCard();
+    startPreviewLoad(link, parsed, true);
+  }
+
+  function onMiddleAuxClick(event) {
+    if (event.button !== 1) return;
+
+    if (card.contains(event.target) && card.classList.contains('tmwp-visible')) {
+      preventMiddleClick(event);
+      return;
+    }
+
+    const link = event.target.closest?.('a[href]');
+    if (pinned) {
+      if (link && activeLink && link === activeLink) preventMiddleClick(event);
+      return;
+    }
+
+    if (link && parseAnyLink(link)) preventMiddleClick(event);
+  }
+
+  function preventMiddleClick(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+  }
+
+  function startPreviewLoad(link, parsed, immediate) {
+    clearTimeout(hoverTimer);
+    clearTimeout(hideTimer);
+    requestToken += 1;
+    const token = requestToken;
+
+    hoverTimer = window.setTimeout(async () => {
+      if (token !== requestToken || activeLink !== link || activeParsed !== parsed) return;
+
+      renderLoading();
+      positionCard(lastPoint.x, lastPoint.y);
+
+      try {
+        const preview = await getPreview(parsed);
+        if (token !== requestToken || activeLink !== link || activeParsed !== parsed) return;
+        renderPreview(preview);
+        positionCard(lastPoint.x, lastPoint.y);
+      } catch (error) {
+        if (token !== requestToken || activeLink !== link || activeParsed !== parsed) return;
+        renderError(error);
+        positionCard(lastPoint.x, lastPoint.y);
+      }
+    }, immediate ? 0 : HOVER_DELAY_MS);
+  }
+
+  function scheduleHide() {
+    if (pinned) return;
+
+    clearTimeout(hoverTimer);
+    clearTimeout(hideTimer);
+    hideTimer = window.setTimeout(() => {
+      if (!cardHovered) hideCard(false);
+    }, HIDE_DELAY_MS);
+  }
+
+  function hideCard(force) {
+    if (pinned && !force) return;
+
+    clearTimeout(hoverTimer);
+    clearTimeout(hideTimer);
+    requestToken += 1;
+    activeLink = null;
+    activeParsed = null;
+    cardHovered = false;
+    pinned = false;
+    card.className = '';
+    card.replaceChildren();
+  }
+
+  function pinCard() {
+    pinned = true;
+    clearTimeout(hideTimer);
+    card.classList.add('tmwp-pinned');
+  }
+
+  function parseAnyLink(link) {
+    const wiki = parseWikipediaLink(link);
+    if (wiki) return wiki;
+
+    let url;
+    try {
+      url = new URL(link.href, location.href);
+    } catch {
+      return null;
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+
+    const query = buildSearchQuery(link, url);
+    if (!query) return null;
+
+    return {
+      kind: 'search',
+      query,
+      href: url.href,
+      cacheKey: `search:${query.toLowerCase()}`,
+    };
+  }
+
+  function parseWikipediaLink(link) {
+    let url;
+    try {
+      url = new URL(link.href, location.href);
+    } catch {
+      return null;
+    }
+
+    const hostMatch = url.hostname.toLowerCase().match(/^([a-z-]+)\.(?:m\.)?wikipedia\.org$/);
+    if (!hostMatch) return null;
+
+    const lang = hostMatch[1];
+    let title = '';
+
+    if (url.pathname.startsWith('/wiki/')) {
+      title = url.pathname.slice('/wiki/'.length);
+    } else if (url.pathname === '/w/index.php') {
+      title = url.searchParams.get('title') || '';
+    }
+
+    if (!title) return null;
+
+    title = decodeTitle(title);
+    if (!title || title === 'Main Page' || title === 'Заглавная страница') return null;
+
+    const namespace = title.includes(':') ? title.slice(0, title.indexOf(':')).toLowerCase() : '';
+    if (namespace && SKIP_NAMESPACES.has(namespace)) return null;
+
+    return {
+      kind: 'exact',
+      lang,
+      title,
+      href: url.href,
+      cacheKey: `exact:${lang}:${title.toLowerCase()}`,
+    };
+  }
+
+  function buildSearchQuery(link, url) {
+    const sources = [
+      getVisibleText(link),
+      link.getAttribute('title'),
+      link.getAttribute('aria-label'),
+      deriveQueryFromUrl(url),
+    ];
+
+    for (const source of sources) {
+      const query = normalizeQuery(source);
+      if (isUsefulQuery(query)) return query;
+    }
+
+    return null;
+  }
+
+  function getVisibleText(link) {
+    const text = link.innerText || link.textContent || '';
+    return text.replace(/\s+/g, ' ').trim();
+  }
+
+  function deriveQueryFromUrl(url) {
+    const pathParts = url.pathname.split('/').filter(Boolean).reverse();
+    for (const part of pathParts) {
+      const decoded = decodeTitle(part)
+        .replace(/\.[a-z0-9]{1,8}$/i, '')
+        .replace(/[-_]+/g, ' ');
+      if (isUsefulQuery(normalizeQuery(decoded))) return decoded;
+    }
+
+    return url.hostname
+      .replace(/^www\./i, '')
+      .split('.')
+      .filter(Boolean)[0]
+      ?.replace(/[-_]+/g, ' ');
+  }
+
+  function normalizeQuery(value) {
+    if (!value) return '';
+
+    let query = String(value)
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s"'`«»“”()[\]{}<>#*•|/\\:;,.!?-]+/g, '')
+      .replace(/[\s"'`«»“”()[\]{}<>#*•|/\\:;,.!?-]+$/g, '')
+      .trim();
+
+    if (/^https?:\/\//i.test(query)) {
+      try {
+        query = deriveQueryFromUrl(new URL(query)) || '';
+      } catch {
+        query = '';
+      }
+    }
+
+    if (query.length > MAX_QUERY_LENGTH) {
+      query = query.slice(0, MAX_QUERY_LENGTH).replace(/\s+\S*$/, '').trim();
+    }
+
+    return query;
+  }
+
+  function isUsefulQuery(query) {
+    if (!query) return false;
+    if (query.length < 2 || query.length > MAX_QUERY_LENGTH) return false;
+    if (/^\d+$/.test(query)) return false;
+    if (/^[^\p{L}\p{N}]+$/u.test(query)) return false;
+
+    const lower = query.toLowerCase();
+    if (GENERIC_LINK_TEXTS.has(lower)) return false;
+
+    const words = query.split(/\s+/).filter(Boolean);
+    if (words.length > 14) return false;
+
+    return true;
+  }
+
+  function decodeTitle(rawTitle) {
+    try {
+      return decodeURIComponent(rawTitle).replace(/_/g, ' ').trim();
+    } catch {
+      return rawTitle.replace(/_/g, ' ').trim();
+    }
+  }
+
+  async function getPreview(parsed) {
+    const cacheKey = parsed.cacheKey;
+    if (cache.has(cacheKey)) {
+      const cached = cache.get(cacheKey);
+      cache.delete(cacheKey);
+      cache.set(cacheKey, cached);
+      return cached;
+    }
+
+    const previewPromise = resolvePreview(parsed).catch((error) => {
+      cache.delete(cacheKey);
+      throw error;
+    });
+
+    cache.set(cacheKey, previewPromise);
+    trimCache();
+    return previewPromise;
+  }
+
+  function resolvePreview(parsed) {
+    if (parsed.kind === 'exact') return resolveExactPreview(parsed);
+    return resolveSearchPreview(parsed);
+  }
+
+  async function resolveExactPreview(parsed) {
+    let targetLang = parsed.lang;
+    let targetTitle = parsed.title;
+    let usedRussianArticle = parsed.lang === 'ru';
+
+    if (parsed.lang !== 'ru') {
+      const ruTitle = await findRussianTitle(parsed.lang, parsed.title);
+      if (ruTitle) {
+        targetLang = 'ru';
+        targetTitle = ruTitle;
+        usedRussianArticle = true;
+      }
+    }
+
+    try {
+      return await fetchSummary(targetLang, targetTitle, {
+        matchType: 'exact',
+        sourceLang: parsed.lang,
+        sourceTitle: parsed.title,
+        sourceQuery: parsed.title,
+        usedRussianArticle,
+      });
+    } catch (error) {
+      if (targetLang === 'ru' && parsed.lang !== 'ru') {
+        return fetchSummary(parsed.lang, parsed.title, {
+          matchType: 'exact',
+          sourceLang: parsed.lang,
+          sourceTitle: parsed.title,
+          sourceQuery: parsed.title,
+          usedRussianArticle: false,
+        });
+      }
+      throw error;
+    }
+  }
+
+  async function resolveSearchPreview(parsed) {
+    const query = parsed.query;
+    const [ruTitle, enTitle] = await Promise.all([
+      searchTitle('ru', query),
+      searchTitle('en', query),
+    ]);
+
+    if (enTitle) {
+      const ruFromEnglish = await findRussianTitle('en', enTitle);
+      if (ruFromEnglish) {
+        return fetchSummary('ru', ruFromEnglish, {
+          matchType: 'search',
+          sourceLang: 'en',
+          sourceTitle: enTitle,
+          sourceQuery: query,
+          usedRussianArticle: true,
+        });
+      }
+    }
+
+    if (ruTitle) {
+      return fetchSummary('ru', ruTitle, {
+        matchType: 'search',
+        sourceLang: 'ru',
+        sourceTitle: ruTitle,
+        sourceQuery: query,
+        usedRussianArticle: true,
+      });
+    }
+
+    if (enTitle) {
+      return fetchSummary('en', enTitle, {
+        matchType: 'search',
+        sourceLang: 'en',
+        sourceTitle: enTitle,
+        sourceQuery: query,
+        usedRussianArticle: false,
+      });
+    }
+
+    throw new Error(`Wikipedia не нашла статью по запросу «${query}»`);
+  }
+
+  async function searchTitle(lang, query) {
+    if (!isLikelyWikiLanguage(lang)) return null;
+
+    const url = new URL(`https://${lang}.wikipedia.org/w/api.php`);
+    url.search = new URLSearchParams({
+      action: 'query',
+      format: 'json',
+      formatversion: '2',
+      list: 'search',
+      srsearch: query,
+      srnamespace: '0',
+      srlimit: '1',
+      redirects: '1',
+      srenablerewrites: '1',
+    }).toString();
+
+    try {
+      const data = await requestJson(url.toString());
+      return data?.query?.search?.[0]?.title || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function findRussianTitle(sourceLang, sourceTitle) {
+    if (!isLikelyWikiLanguage(sourceLang)) return null;
+
+    const url = new URL(`https://${sourceLang}.wikipedia.org/w/api.php`);
+    url.search = new URLSearchParams({
+      action: 'query',
+      format: 'json',
+      formatversion: '2',
+      prop: 'langlinks',
+      titles: sourceTitle,
+      lllang: 'ru',
+      lllimit: '1',
+      redirects: '1',
+    }).toString();
+
+    try {
+      const data = await requestJson(url.toString());
+      const page = data?.query?.pages?.[0];
+      return page?.langlinks?.[0]?.title || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function fetchSummary(lang, title, meta) {
+    if (!isLikelyWikiLanguage(lang)) throw new Error('Неподдерживаемый языковой раздел Wikipedia');
+
+    const encodedTitle = encodeURIComponent(title.replace(/ /g, '_'));
+    const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodedTitle}?redirect=true`;
+    const data = await requestJson(url);
+
+    if (!data || data.type === 'https://mediawiki.org/wiki/HyperSwitch/errors/not_found') {
+      throw new Error('Статья не найдена');
+    }
+
+    return {
+      lang,
+      title: data.title || title,
+      description: data.description || '',
+      extract: data.extract || '',
+      thumbnail: data.thumbnail?.source || '',
+      pageUrl: data.content_urls?.desktop?.page || `https://${lang}.wikipedia.org/wiki/${encodedTitle}`,
+      isDisambiguation: data.type === 'disambiguation',
+      ...meta,
+    };
+  }
+
+  function requestJson(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: {
+          Accept: 'application/json',
+        },
+        timeout: 10000,
+        onload(response) {
+          if (response.status < 200 || response.status >= 300) {
+            reject(new Error(`Wikipedia API вернул HTTP ${response.status}`));
+            return;
+          }
+
+          try {
+            resolve(JSON.parse(response.responseText));
+          } catch {
+            reject(new Error('Не удалось прочитать ответ Wikipedia API'));
+          }
+        },
+        onerror() {
+          reject(new Error('Не удалось подключиться к Wikipedia API'));
+        },
+        ontimeout() {
+          reject(new Error('Wikipedia API не ответил вовремя'));
+        },
+      });
+    });
+  }
+
+  function renderLoading() {
+    const body = el('div', 'tmwp-loading-body');
+    body.appendChild(el('div', 'tmwp-spinner'));
+    body.appendChild(el('div', 'tmwp-loading-text', 'Загрузка превью…'));
+    renderShell(body, 'tmwp-loading');
+  }
+
+  function renderPreview(preview) {
+    const content = el('div', `tmwp-content ${preview.thumbnail ? 'tmwp-has-image' : 'tmwp-no-image'}`);
+
+    if (preview.thumbnail) {
+      const imageWrap = el('a', 'tmwp-image-link');
+      imageWrap.href = preview.pageUrl;
+      imageWrap.target = '_blank';
+      imageWrap.rel = 'noopener noreferrer';
+
+      const image = document.createElement('img');
+      image.src = preview.thumbnail;
+      image.alt = '';
+      image.loading = 'lazy';
+      imageWrap.appendChild(image);
+      content.appendChild(imageWrap);
+    }
+
+    const body = el('div', 'tmwp-body');
+    const meta = el('div', 'tmwp-meta');
+    meta.appendChild(el('span', 'tmwp-lang', preview.lang.toUpperCase()));
+    meta.appendChild(el('span', 'tmwp-source-note', getSourceNote(preview)));
+
+    const title = el('a', 'tmwp-title', preview.title);
+    title.href = preview.pageUrl;
+    title.target = '_blank';
+    title.rel = 'noopener noreferrer';
+
+    body.appendChild(meta);
+    body.appendChild(title);
+
+    if (preview.description) {
+      body.appendChild(el('div', 'tmwp-description', capitalize(preview.description)));
+    }
+
+    if (preview.extract) {
+      body.appendChild(el('p', 'tmwp-extract', preview.extract));
+    }
+
+    if (preview.isDisambiguation) {
+      body.appendChild(el('div', 'tmwp-disambiguation', 'Страница значений'));
+    }
+
+    content.appendChild(body);
+    renderShell(content, '');
+  }
+
+  function renderError(error) {
+    const body = el('div', 'tmwp-error-body');
+    body.appendChild(el('div', 'tmwp-error-title', 'Превью недоступно'));
+    body.appendChild(el('div', 'tmwp-error-text', error?.message || 'Не удалось загрузить данные Wikipedia'));
+    renderShell(body, 'tmwp-error');
+  }
+
+  function renderShell(content, extraClass) {
+    const actions = el('div', 'tmwp-actions');
+    actions.appendChild(el('span', 'tmwp-pin-label', 'Закреплено'));
+
+    const closeButton = el('button', 'tmwp-close', '×');
+    closeButton.type = 'button';
+    closeButton.setAttribute('aria-label', 'Закрыть превью');
+    closeButton.addEventListener('click', () => hideCard(true));
+    actions.appendChild(closeButton);
+
+    card.className = `tmwp-visible ${pinned ? 'tmwp-pinned' : ''} ${extraClass || ''}`.trim();
+    card.replaceChildren(actions, content);
+  }
+
+  function getSourceNote(preview) {
+    if (preview.matchType === 'search') {
+      return preview.usedRussianArticle ? 'Найдено в русской Wikipedia' : 'Найдено в английской Wikipedia';
+    }
+
+    if (preview.usedRussianArticle) return 'Русская статья';
+    if (preview.sourceLang === 'en') return 'Английская статья';
+    return `${preview.sourceLang.toUpperCase()} статья`;
+  }
+
+  function positionCard(x, y) {
+    card.classList.add('tmwp-visible');
+    if (pinned) card.classList.add('tmwp-pinned');
+
+    const gap = 16;
+    const pad = 12;
+    const width = card.offsetWidth;
+    const height = card.offsetHeight;
+
+    let left = x + gap;
+    let top = y + gap;
+
+    if (left + width > window.innerWidth - pad) {
+      left = x - width - gap;
+    }
+    if (top + height > window.innerHeight - pad) {
+      top = window.innerHeight - height - pad;
+    }
+
+    card.style.left = `${Math.max(pad, left)}px`;
+    card.style.top = `${Math.max(pad, top)}px`;
+  }
+
+  function pointNearElement(element) {
+    const rect = element.getBoundingClientRect();
+    return {
+      x: rect.left + Math.min(rect.width / 2, 180),
+      y: rect.bottom,
+    };
+  }
+
+  function trimCache() {
+    while (cache.size > CACHE_LIMIT) {
+      cache.delete(cache.keys().next().value);
+    }
+  }
+
+  function isLikelyWikiLanguage(lang) {
+    return /^[a-z-]{2,12}$/i.test(lang);
+  }
+
+  function capitalize(text) {
+    if (!text) return '';
+    return text.slice(0, 1).toUpperCase() + text.slice(1);
+  }
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function installStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+      #${SCRIPT_ID} {
+        --tmwp-bg: #15171c;
+        --tmwp-panel: #1d2027;
+        --tmwp-text: #f3f5f8;
+        --tmwp-muted: #aeb6c4;
+        --tmwp-border: rgba(255, 255, 255, 0.14);
+        --tmwp-accent: #8fb9ff;
+        --tmwp-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+        background: var(--tmwp-bg);
+        border: 1px solid var(--tmwp-border);
+        border-radius: 8px;
+        box-shadow: var(--tmwp-shadow);
+        color: var(--tmwp-text);
+        display: none;
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        left: 0;
+        max-width: min(380px, calc(100vw - 24px));
+        overflow: hidden;
+        position: fixed;
+        top: 0;
+        user-select: text;
+        width: 380px;
+        z-index: 2147483647;
+      }
+
+      #${SCRIPT_ID}[data-theme="light"] {
+        --tmwp-bg: #ffffff;
+        --tmwp-panel: #f5f7fa;
+        --tmwp-text: #20242c;
+        --tmwp-muted: #586170;
+        --tmwp-border: rgba(31, 35, 42, 0.15);
+        --tmwp-accent: #285eb8;
+        --tmwp-shadow: 0 18px 44px rgba(38, 46, 58, 0.22);
+      }
+
+      @media (prefers-color-scheme: light) {
+        #${SCRIPT_ID}[data-theme="auto"] {
+          --tmwp-bg: #ffffff;
+          --tmwp-panel: #f5f7fa;
+          --tmwp-text: #20242c;
+          --tmwp-muted: #586170;
+          --tmwp-border: rgba(31, 35, 42, 0.15);
+          --tmwp-accent: #285eb8;
+          --tmwp-shadow: 0 18px 44px rgba(38, 46, 58, 0.22);
+        }
+      }
+
+      #${SCRIPT_ID}.tmwp-visible {
+        display: block;
+      }
+
+      #${SCRIPT_ID} .tmwp-actions {
+        align-items: center;
+        border-bottom: 1px solid var(--tmwp-border);
+        box-sizing: border-box;
+        display: none;
+        justify-content: space-between;
+        min-height: 34px;
+        padding: 5px 8px 5px 12px;
+      }
+
+      #${SCRIPT_ID}.tmwp-pinned .tmwp-actions {
+        display: flex;
+      }
+
+      #${SCRIPT_ID} .tmwp-pin-label {
+        color: var(--tmwp-muted);
+        font-size: 12px;
+        line-height: 1;
+      }
+
+      #${SCRIPT_ID} .tmwp-close {
+        align-items: center;
+        background: transparent;
+        border: 1px solid var(--tmwp-border);
+        border-radius: 6px;
+        color: var(--tmwp-muted);
+        cursor: pointer;
+        display: inline-flex;
+        font: 18px/1 Arial, sans-serif;
+        height: 24px;
+        justify-content: center;
+        padding: 0;
+        width: 24px;
+      }
+
+      #${SCRIPT_ID} .tmwp-close:hover {
+        color: var(--tmwp-text);
+        border-color: var(--tmwp-accent);
+      }
+
+      #${SCRIPT_ID} .tmwp-content.tmwp-has-image {
+        display: grid;
+        grid-template-columns: 116px minmax(0, 1fr);
+        min-height: 132px;
+      }
+
+      #${SCRIPT_ID} .tmwp-content.tmwp-no-image {
+        display: block;
+      }
+
+      #${SCRIPT_ID} .tmwp-image-link {
+        background: var(--tmwp-panel);
+        display: block;
+        min-height: 100%;
+        overflow: hidden;
+      }
+
+      #${SCRIPT_ID} img {
+        display: block;
+        height: 100%;
+        object-fit: cover;
+        width: 100%;
+      }
+
+      #${SCRIPT_ID} .tmwp-body {
+        box-sizing: border-box;
+        min-width: 0;
+        padding: 13px 14px 14px;
+      }
+
+      #${SCRIPT_ID} .tmwp-meta {
+        align-items: center;
+        color: var(--tmwp-muted);
+        display: flex;
+        font-size: 11px;
+        gap: 7px;
+        margin-bottom: 4px;
+        text-transform: uppercase;
+      }
+
+      #${SCRIPT_ID} .tmwp-lang {
+        border: 1px solid var(--tmwp-border);
+        border-radius: 999px;
+        color: var(--tmwp-text);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0;
+        line-height: 1;
+        padding: 4px 6px;
+      }
+
+      #${SCRIPT_ID} .tmwp-source-note {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      #${SCRIPT_ID} .tmwp-title {
+        color: var(--tmwp-text);
+        display: block;
+        font-size: 17px;
+        font-weight: 700;
+        line-height: 1.25;
+        margin: 0 0 4px;
+        overflow-wrap: anywhere;
+        text-decoration: none;
+      }
+
+      #${SCRIPT_ID} .tmwp-title:hover {
+        color: var(--tmwp-accent);
+        text-decoration: underline;
+      }
+
+      #${SCRIPT_ID} .tmwp-description {
+        color: var(--tmwp-muted);
+        font-size: 12px;
+        margin-bottom: 8px;
+        overflow-wrap: anywhere;
+      }
+
+      #${SCRIPT_ID} .tmwp-extract {
+        color: var(--tmwp-text);
+        display: -webkit-box;
+        font-size: 13px;
+        line-height: 1.45;
+        margin: 0;
+        overflow: hidden;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 6;
+      }
+
+      #${SCRIPT_ID}.tmwp-pinned .tmwp-extract {
+        display: block;
+        max-height: 260px;
+        overflow: auto;
+        padding-right: 4px;
+      }
+
+      #${SCRIPT_ID} .tmwp-disambiguation {
+        color: var(--tmwp-muted);
+        font-size: 12px;
+        margin-top: 9px;
+      }
+
+      #${SCRIPT_ID}.tmwp-loading .tmwp-loading-body {
+        align-items: center;
+        box-sizing: border-box;
+        display: flex;
+        gap: 12px;
+        min-height: 74px;
+        padding: 14px;
+      }
+
+      #${SCRIPT_ID}.tmwp-error .tmwp-error-body {
+        box-sizing: border-box;
+        min-height: 74px;
+        padding: 14px;
+      }
+
+      #${SCRIPT_ID} .tmwp-spinner {
+        animation: tmwp-spin 0.85s linear infinite;
+        border: 2px solid var(--tmwp-border);
+        border-top-color: var(--tmwp-accent);
+        border-radius: 999px;
+        flex: 0 0 auto;
+        height: 18px;
+        width: 18px;
+      }
+
+      #${SCRIPT_ID} .tmwp-loading-text,
+      #${SCRIPT_ID} .tmwp-error-text {
+        color: var(--tmwp-muted);
+        font-size: 13px;
+      }
+
+      #${SCRIPT_ID} .tmwp-error-title {
+        color: var(--tmwp-text);
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 4px;
+      }
+
+      @keyframes tmwp-spin {
+        to { transform: rotate(360deg); }
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+})();
