@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiPeek RU
 // @namespace    https://github.com/Sinusis/wikipeek-ru
-// @version      1.0.3
+// @version      1.0.4
 // @description  Предпросмотр статей Wikipedia для любых ссылок: сначала русская версия, затем английская.
 // @author       ChatGPT/Sinusis
 // @updateURL    https://raw.githubusercontent.com/Sinusis/wikipeek-ru/refs/heads/main/WikiPeek%20RU
@@ -84,8 +84,10 @@
   const UTILITY_LINK_PATTERNS = [
     /\b(user\s*agreement|terms(?:\s*of\s*(?:use|service))?|privacy\s*policy|content\s*policy|cookie\s*policy|accessibility|moderators?)\b/i,
     /\b(help|support|contact|careers|press|advertise|download|login|log\s*in|sign\s*in|sign\s*up|register)\b/i,
+    /\b(profile|account|settings|messages?|my\s*messages?|inbox|private\s*messages?|notifications?|pm|dm)\b/i,
     /\b(\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u043e\u0435\s*\u0441\u043e\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435|\u0443\u0441\u043b\u043e\u0432\u0438\u044f\s*(?:\u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u0438\u044f|\u0441\u0435\u0440\u0432\u0438\u0441\u0430)|\u043f\u043e\u043b\u0438\u0442\u0438\u043a\u0430\s*\u043a\u043e\u043d\u0444\u0438\u0434\u0435\u043d\u0446\u0438\u0430\u043b\u044c\u043d\u043e\u0441\u0442\u0438|\u043f\u043e\u043b\u0438\u0442\u0438\u043a\u0430\s*\u043a\u043e\u043d\u0442\u0435\u043d\u0442\u0430|cookie|\u043a\u0443\u043a\u0438|\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e\u0441\u0442\u044c|\u043c\u043e\u0434\u0435\u0440\u0430\u0442\u043e\u0440\u044b?)\b/i,
     /\b(\u043f\u043e\u043c\u043e\u0449\u044c|\u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430|\u043a\u043e\u043d\u0442\u0430\u043a\u0442\u044b|\u043a\u0430\u0440\u044c\u0435\u0440\u0430|\u043f\u0440\u0435\u0441\u0441\u0430|\u0440\u0435\u043a\u043b\u0430\u043c\u0430|\u0441\u043a\u0430\u0447\u0430\u0442\u044c|\u0432\u043e\u0439\u0442\u0438|\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f)\b/i,
+    /(?:^|[^\p{L}\p{N}])(\u043f\u0440\u043e\u0444\u0438\u043b\u044c|\u0430\u043a\u043a\u0430\u0443\u043d\u0442|\u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438|\u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u044f?|\u043c\u043e\u0438\s*\u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u044f|\u043b\u0438\u0447\u043d\u044b\u0435\s*\u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u044f|\u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f|\u043b\u0441)(?:$|[^\p{L}\p{N}])/iu,
   ];
 
   const cache = new Map();
@@ -443,7 +445,7 @@
 
   function isUsefulQuery(query) {
     if (!query) return false;
-    if (query.length < 2 || query.length > MAX_QUERY_LENGTH) return false;
+    if (query.length < 3 || query.length > MAX_QUERY_LENGTH) return false;
     if (/^\d+$/.test(query)) return false;
     if (/^[^\p{L}\p{N}]+$/u.test(query)) return false;
 
@@ -648,8 +650,17 @@
     const titleBaseMatch = normalizeForMatch(title.replace(/\s*\([^)]*\)\s*$/g, ''));
     const queryMatch = normalizeForMatch(query);
     const snippetMatch = normalizeForMatch(stripHtml(result?.snippet || ''));
+    const hasTitleSignal =
+      titleMatch === queryMatch ||
+      titleBaseMatch === queryMatch ||
+      titleMatch.startsWith(`${queryMatch} `) ||
+      titleBaseMatch.startsWith(`${queryMatch} `) ||
+      titleMatch.includes(queryMatch) ||
+      titleBaseMatch.includes(queryMatch);
 
     let score = 0;
+
+    if (!hasTitleSignal) return -1000;
 
     if (titleMatch === queryMatch) score += 1000;
     else if (titleBaseMatch === queryMatch) score += 850;
