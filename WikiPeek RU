@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiPeek RU
 // @namespace    https://github.com/Sinusis/wikipeek-ru
-// @version      1.0.0
+// @version      1.0.1
 // @description  Предпросмотр статей Wikipedia для любых ссылок: сначала русская версия, затем английская.
 // @author       ChatGPT/Sinusis
 // @match        *://*/*
@@ -23,6 +23,7 @@
   const HIDE_DELAY_MS = 140;
   const CACHE_LIMIT = 250;
   const MAX_QUERY_LENGTH = 120;
+  const SEARCH_RESULT_LIMIT = 5;
 
   const SKIP_NAMESPACES = new Set([
     'special',
@@ -503,10 +504,50 @@
 
   async function resolveSearchPreview(parsed) {
     const query = parsed.query;
-    const [ruTitle, enTitle] = await Promise.all([
-      searchTitle('ru', query),
-      searchTitle('en', query),
-    ]);
+
+    const ruExact = await tryFetchSummary('ru', query, {
+      matchType: 'search',
+      sourceLang: 'ru',
+      sourceTitle: query,
+      sourceQuery: query,
+      usedRussianArticle: true,
+    });
+    if (ruExact && !ruExact.isDisambiguation) return ruExact;
+
+    const enExact = await tryFetchSummary('en', query, {
+      matchType: 'search',
+      sourceLang: 'en',
+      sourceTitle: query,
+      sourceQuery: query,
+      usedRussianArticle: false,
+    });
+    if (enExact && !enExact.isDisambiguation) {
+      const ruFromEnglish = await findRussianTitle('en', enExact.title);
+      if (ruFromEnglish) {
+        return fetchSummary('ru', ruFromEnglish, {
+          matchType: 'search',
+          sourceLang: 'en',
+          sourceTitle: enExact.title,
+          sourceQuery: query,
+          usedRussianArticle: true,
+        });
+      }
+      return enExact;
+    }
+
+    const ruTitle = pickBestSearchTitle(await searchTitles('ru', query), query);
+
+    if (ruTitle) {
+      return fetchSummary('ru', ruTitle, {
+        matchType: 'search',
+        sourceLang: 'ru',
+        sourceTitle: ruTitle,
+        sourceQuery: query,
+        usedRussianArticle: true,
+      });
+    }
+
+    const enTitle = pickBestSearchTitle(await searchTitles('en', query), query);
 
     if (enTitle) {
       const ruFromEnglish = await findRussianTitle('en', enTitle);
@@ -519,19 +560,7 @@
           usedRussianArticle: true,
         });
       }
-    }
 
-    if (ruTitle) {
-      return fetchSummary('ru', ruTitle, {
-        matchType: 'search',
-        sourceLang: 'ru',
-        sourceTitle: ruTitle,
-        sourceQuery: query,
-        usedRussianArticle: true,
-      });
-    }
-
-    if (enTitle) {
       return fetchSummary('en', enTitle, {
         matchType: 'search',
         sourceLang: 'en',
@@ -544,7 +573,15 @@
     throw new Error(`Wikipedia не нашла статью по запросу «${query}»`);
   }
 
-  async function searchTitle(lang, query) {
+  async function tryFetchSummary(lang, title, meta) {
+    try {
+      return await fetchSummary(lang, title, meta);
+    } catch {
+      return null;
+    }
+  }
+
+  async function searchTitles(lang, query) {
     if (!isLikelyWikiLanguage(lang)) return null;
 
     const url = new URL(`https://${lang}.wikipedia.org/w/api.php`);
@@ -555,17 +592,70 @@
       list: 'search',
       srsearch: query,
       srnamespace: '0',
-      srlimit: '1',
+      srlimit: String(SEARCH_RESULT_LIMIT),
+      srprop: 'size|wordcount|snippet|timestamp',
       redirects: '1',
       srenablerewrites: '1',
     }).toString();
 
     try {
       const data = await requestJson(url.toString());
-      return data?.query?.search?.[0]?.title || null;
+      return data?.query?.search || [];
     } catch {
-      return null;
+      return [];
     }
+  }
+
+  function pickBestSearchTitle(results, query) {
+    if (!Array.isArray(results) || results.length === 0) return null;
+
+    const scored = results
+      .map((result, index) => ({
+        result,
+        score: scoreSearchResult(result, query, index),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    return scored[0]?.score >= 15 ? scored[0].result.title : null;
+  }
+
+  function scoreSearchResult(result, query, index) {
+    const title = result?.title || '';
+    const titleMatch = normalizeForMatch(title);
+    const titleBaseMatch = normalizeForMatch(title.replace(/\s*\([^)]*\)\s*$/g, ''));
+    const queryMatch = normalizeForMatch(query);
+    const snippetMatch = normalizeForMatch(stripHtml(result?.snippet || ''));
+
+    let score = 0;
+
+    if (titleMatch === queryMatch) score += 1000;
+    else if (titleBaseMatch === queryMatch) score += 850;
+    else if (titleMatch.startsWith(`${queryMatch} `)) score += 260;
+    else if (titleBaseMatch.startsWith(`${queryMatch} `)) score += 220;
+    else if (titleMatch.includes(queryMatch)) score += 120;
+
+    if (snippetMatch.includes(queryMatch)) score += 20;
+    score += Math.min(Number(result?.wordcount) || 0, 6000) / 300;
+    score += Math.max(0, SEARCH_RESULT_LIMIT - index) * 2;
+
+    if (/\((значения|disambiguation)\)$/i.test(title)) score -= 300;
+    if (/\([^)]*\)$/.test(title) && titleBaseMatch !== queryMatch) score -= 35;
+
+    return score;
+  }
+
+  function normalizeForMatch(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/&[a-z]+;/gi, ' ')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim()
+      .replace(/\s+/g, ' ');
+  }
+
+  function stripHtml(text) {
+    return String(text || '').replace(/<[^>]*>/g, ' ');
   }
 
   async function findRussianTitle(sourceLang, sourceTitle) {
